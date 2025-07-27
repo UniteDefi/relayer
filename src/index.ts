@@ -43,12 +43,12 @@ async function startServer() {
   app.listen(port, () => {
     console.log(`🚀 Relayer Service started on port ${port}`);
     console.log(`📡 API endpoints:`);
-    console.log(`   POST /api/create-swap - Create new swap auction`);
+    console.log(`   POST /api/create-swap - Create new swap order`);
     console.log(`   POST /api/commit-resolver - Resolver commits to fill`);
-    console.log(`   POST /api/move-user-funds - Move user funds to escrow`);
+    console.log(`   POST /api/escrows-ready - Notify escrows are deployed`);
     console.log(`   POST /api/notify-completion - Notify trade completion`);
-    console.log(`   GET  /api/auction-status/:id - Get auction status`);
-    console.log(`   GET  /api/active-auctions - List active auctions`);
+    console.log(`   GET  /api/order-status/:id - Get order status`);
+    console.log(`   GET  /api/active-orders - List active orders`);
     console.log(`   GET  /health - Health check`);
     console.log(`\n🔗 Connected chains:`);
     Object.values(config.chains).forEach(chain => {
