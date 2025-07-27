@@ -15,48 +15,59 @@ export interface SwapRequest {
   // HTLC details
   secretHash: string;
   
-  // Dutch auction parameters
-  startPrice: string;  // Starting price in dst tokens
-  endPrice: string;    // Ending price in dst tokens
-  auctionDuration: number; // Duration in seconds
+  // Order parameters
+  minAcceptablePrice: string;  // Minimum acceptable price in dst tokens
+  orderDuration: number; // Order duration in seconds
 }
 
-export interface AuctionData {
-  auctionId: string;
+export interface OrderData {
+  orderId: string;
   swapRequest: SwapRequest;
-  status: "pending" | "committed" | "settling" | "completed" | "failed";
+  marketPrice: string;  // Current market price when order was created
+  status: "active" | "committed" | "settling" | "completed" | "failed" | "rescue_available";
   resolver?: string;
   createdAt: number;
   expiresAt: number;
   
-  // Escrow details (after resolver commits)
+  // Commitment details
+  committedPrice?: string;
+  commitmentTime?: number;
+  commitmentDeadline?: number; // 5 minutes after commitment
+  
+  // Escrow details (after resolver deploys)
   srcEscrowAddress?: string;
   dstEscrowAddress?: string;
   
-  // Settlement details
+  // Settlement tracking
+  userFundsMoved?: boolean;
+  userFundsMovedAt?: number;
   settlementTx?: {
     srcChainTxHash?: string;
     dstChainTxHash?: string;
   };
   
   // Secret management
-  secret?: string;
   secretRevealedAt?: number;
 }
 
 export interface ResolverCommitment {
-  auctionId: string;
+  orderId: string;
+  resolverAddress: string;
+  acceptedPrice: string;
+  timestamp: number;
+}
+
+export interface EscrowReadyNotification {
+  orderId: string;
   resolverAddress: string;
   srcEscrowAddress: string;
   dstEscrowAddress: string;
   srcSafetyDepositTx: string;
   dstSafetyDepositTx: string;
-  committedPrice: string;
-  timestamp: number;
 }
 
 export interface SettlementNotification {
-  auctionId: string;
+  orderId: string;
   resolverAddress: string;
   dstTokenAmount: string;
   dstTxHash: string;
