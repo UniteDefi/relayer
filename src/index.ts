@@ -1,0 +1,64 @@
+import express from "express";
+import cors from "cors";
+import bodyParser from "body-parser";
+import dotenv from "dotenv";
+import { config } from "./config";
+import { BlockchainService } from "./services/blockchain.service";
+import { AuctionService } from "./services/auction.service";
+import { createSwapRoutes } from "./routes/swap.routes";
+
+dotenv.config();
+
+async function startServer() {
+  const app = express();
+  
+  // Middleware
+  app.use(cors({
+    origin: config.api.corsOrigins
+  }));
+  app.use(bodyParser.json({ limit: config.api.maxRequestSize }));
+  app.use(bodyParser.urlencoded({ extended: true, limit: config.api.maxRequestSize }));
+  
+  // Initialize services
+  const blockchainService = new BlockchainService();
+  const auctionService = new AuctionService(blockchainService);
+  
+  // Routes
+  app.use("/api", createSwapRoutes(auctionService));
+  
+  // Health check
+  app.get("/health", (req, res) => {
+    res.json({ 
+      status: "ok", 
+      timestamp: new Date().toISOString(),
+      chains: Object.keys(config.chains).map(id => ({
+        chainId: id,
+        name: config.chains[Number(id)].name
+      }))
+    });
+  });
+  
+  // Start server
+  const port = config.port;
+  app.listen(port, () => {
+    console.log(`🚀 Relayer Service started on port ${port}`);
+    console.log(`📡 API endpoints:`);
+    console.log(`   POST /api/create-swap - Create new swap auction`);
+    console.log(`   POST /api/commit-resolver - Resolver commits to fill`);
+    console.log(`   POST /api/move-user-funds - Move user funds to escrow`);
+    console.log(`   POST /api/notify-completion - Notify trade completion`);
+    console.log(`   GET  /api/auction-status/:id - Get auction status`);
+    console.log(`   GET  /api/active-auctions - List active auctions`);
+    console.log(`   GET  /health - Health check`);
+    console.log(`\n🔗 Connected chains:`);
+    Object.values(config.chains).forEach(chain => {
+      console.log(`   - ${chain.name} (${chain.chainId})`);
+    });
+  });
+}
+
+// Start the server
+startServer().catch(error => {
+  console.error("Failed to start server:", error);
+  process.exit(1);
+});
