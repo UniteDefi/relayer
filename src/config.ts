@@ -34,10 +34,10 @@ export const config = {
     }
   } as Record<number, ChainConfig>,
   
-  // Auction parameters
-  auction: {
+  // Order parameters
+  order: {
     defaultDuration: 300, // 5 minutes
-    resolverTimeLimit: 180, // 3 minutes to complete after commitment
+    resolverTimeLimit: 300, // 5 minutes to complete after commitment
     minSafetyDeposit: "0.001", // ETH
     secretRevealDelay: 10 // seconds to wait after confirmations
   },
