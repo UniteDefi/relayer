@@ -1,6 +1,6 @@
 import { Router, Request, Response } from "express";
 import { AuctionService } from "../services/auction.service";
-import { SwapRequest, ResolverCommitment, SettlementNotification } from "../types";
+import { SwapRequest, ResolverCommitment, SettlementNotification, EscrowReadyNotification } from "../types";
 import { ethers } from "ethers";
 
 export function createSwapRoutes(auctionService: AuctionService): Router {
@@ -19,13 +19,14 @@ export function createSwapRoutes(auctionService: AuctionService): Router {
       // Verify signature (simplified for demo)
       // In production, verify the signature matches the swap request
       
-      // Create auction
-      const auction = await auctionService.createAuction(swapRequest, secret);
+      // Create order
+      const order = await auctionService.createOrder(swapRequest, secret);
       
       res.json({
         success: true,
-        auctionId: auction.auctionId,
-        expiresAt: auction.expiresAt
+        orderId: order.orderId,
+        marketPrice: order.marketPrice,
+        expiresAt: order.expiresAt
       });
       
     } catch (error: any) {
@@ -34,24 +35,21 @@ export function createSwapRoutes(auctionService: AuctionService): Router {
     }
   });
   
-  // Resolver commits to fill an auction
+  // Resolver commits to fill an order
   router.post("/commit-resolver", async (req: Request, res: Response) => {
     try {
       const commitment: ResolverCommitment = req.body;
       
       // Validate commitment
-      if (!commitment.auctionId || !commitment.resolverAddress || 
-          !commitment.srcEscrowAddress || !commitment.dstEscrowAddress) {
+      if (!commitment.orderId || !commitment.resolverAddress || 
+          !commitment.acceptedPrice) {
         return res.status(400).json({ error: "Invalid commitment data" });
       }
       
       // Process commitment
-      await auctionService.commitResolver(commitment);
+      const result = await auctionService.commitResolver(commitment);
       
-      res.json({
-        success: true,
-        message: "Resolver commitment accepted"
-      });
+      res.json(result);
       
     } catch (error: any) {
       console.error("[API] Error committing resolver:", error);
@@ -59,35 +57,46 @@ export function createSwapRoutes(auctionService: AuctionService): Router {
     }
   });
   
-  // Move user's pre-approved funds to escrow
-  router.post("/move-user-funds", async (req: Request, res: Response) => {
+  // Resolver notifies escrows are ready
+  router.post("/escrows-ready", async (req: Request, res: Response) => {
     try {
-      const { auctionId, resolverAddress } = req.body;
+      const notification: EscrowReadyNotification = req.body;
       
-      if (!auctionId || !resolverAddress) {
-        return res.status(400).json({ error: "Missing auction ID or resolver address" });
+      // Validate notification
+      if (!notification.orderId || !notification.resolverAddress || 
+          !notification.srcEscrowAddress || !notification.dstEscrowAddress ||
+          !notification.srcSafetyDepositTx || !notification.dstSafetyDepositTx) {
+        return res.status(400).json({ error: "Invalid escrow notification data" });
       }
       
-      // Get auction and verify resolver
-      const auction = auctionService.getAuction(auctionId);
-      if (!auction) {
-        return res.status(404).json({ error: "Auction not found" });
-      }
-      
-      if (auction.resolver !== resolverAddress) {
-        return res.status(403).json({ error: "Unauthorized resolver" });
-      }
-      
-      // Move funds
-      const txHash = await auctionService.moveUserFunds(auctionId);
+      // Process notification
+      await auctionService.escrowsReady(notification);
       
       res.json({
         success: true,
-        txHash
+        message: "Escrows ready, moving user funds"
       });
       
     } catch (error: any) {
-      console.error("[API] Error moving user funds:", error);
+      console.error("[API] Error processing escrow notification:", error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+  
+  // Get order status
+  router.get("/order-status/:orderId", (req: Request, res: Response) => {
+    try {
+      const { orderId } = req.params;
+      
+      const status = auctionService.getOrderStatus(orderId);
+      if (!status) {
+        return res.status(404).json({ error: "Order not found" });
+      }
+      
+      res.json(status);
+      
+    } catch (error: any) {
+      console.error("[API] Error getting order status:", error);
       res.status(500).json({ error: error.message });
     }
   });
@@ -98,7 +107,7 @@ export function createSwapRoutes(auctionService: AuctionService): Router {
       const notification: SettlementNotification = req.body;
       
       // Validate notification
-      if (!notification.auctionId || !notification.resolverAddress || 
+      if (!notification.orderId || !notification.resolverAddress || 
           !notification.dstTxHash || !notification.dstTokenAmount) {
         return res.status(400).json({ error: "Invalid notification data" });
       }
@@ -117,81 +126,44 @@ export function createSwapRoutes(auctionService: AuctionService): Router {
     }
   });
   
-  // Get auction status
+  // Legacy auction status endpoint (redirect to order status)
   router.get("/auction-status/:auctionId", (req: Request, res: Response) => {
+    res.redirect(`/api/order-status/${req.params.auctionId}`);
+  });
+  
+  // Get all active orders (for resolvers to monitor)
+  router.get("/active-orders", (req: Request, res: Response) => {
     try {
-      const { auctionId } = req.params;
+      const activeOrders = auctionService.getAllActiveOrders();
       
-      const auction = auctionService.getAuction(auctionId);
-      if (!auction) {
-        return res.status(404).json({ error: "Auction not found" });
-      }
+      // Remove sensitive data
+      const safeOrders = activeOrders.map(order => ({
+        orderId: order.orderId,
+        srcChainId: order.swapRequest.srcChainId,
+        srcToken: order.swapRequest.srcToken,
+        srcAmount: order.swapRequest.srcAmount,
+        dstChainId: order.swapRequest.dstChainId,
+        dstToken: order.swapRequest.dstToken,
+        marketPrice: order.marketPrice,
+        userAddress: order.swapRequest.userAddress,
+        secretHash: order.swapRequest.secretHash,
+        createdAt: order.createdAt,
+        expiresAt: order.expiresAt,
+        status: order.status
+      }));
       
-      // Don't expose the secret
-      const { swapRequest, ...safeAuctionData } = auction;
-      
-      res.json({
-        ...safeAuctionData,
-        swapRequest: {
-          ...swapRequest,
-          signature: undefined // Remove signature from response
-        }
-      });
+      res.json(safeOrders);
       
     } catch (error: any) {
-      console.error("[API] Error getting auction status:", error);
+      console.error("[API] Error getting active orders:", error);
       res.status(500).json({ error: error.message });
     }
   });
   
-  // Get all active auctions (for resolvers to monitor)
+  // Legacy endpoint redirect
   router.get("/active-auctions", (req: Request, res: Response) => {
-    try {
-      const allAuctions = auctionService.getAllAuctions();
-      const activeAuctions = allAuctions.filter(a => 
-        a.status === "pending" && a.expiresAt > Date.now()
-      );
-      
-      // Remove sensitive data
-      const safeAuctions = activeAuctions.map(auction => ({
-        auctionId: auction.auctionId,
-        srcChainId: auction.swapRequest.srcChainId,
-        srcToken: auction.swapRequest.srcToken,
-        srcAmount: auction.swapRequest.srcAmount,
-        dstChainId: auction.swapRequest.dstChainId,
-        dstToken: auction.swapRequest.dstToken,
-        startPrice: auction.swapRequest.startPrice,
-        endPrice: auction.swapRequest.endPrice,
-        createdAt: auction.createdAt,
-        expiresAt: auction.expiresAt,
-        currentPrice: calculateCurrentPrice(auction)
-      }));
-      
-      res.json(safeAuctions);
-      
-    } catch (error: any) {
-      console.error("[API] Error getting active auctions:", error);
-      res.status(500).json({ error: error.message });
-    }
+    res.redirect("/api/active-orders");
   });
   
   return router;
-}
-
-function calculateCurrentPrice(auction: any): string {
-  const now = Date.now();
-  const elapsed = now - auction.createdAt;
-  const duration = auction.expiresAt - auction.createdAt;
-  
-  if (elapsed >= duration) {
-    return auction.swapRequest.endPrice;
-  }
-  
-  const startPrice = BigInt(auction.swapRequest.startPrice);
-  const endPrice = BigInt(auction.swapRequest.endPrice);
-  const priceDiff = startPrice - endPrice;
-  
-  const currentPrice = startPrice - (priceDiff * BigInt(elapsed) / BigInt(duration));
-  
-  return currentPrice.toString();
 }
