@@ -6,27 +6,38 @@ import { ethers } from "ethers";
 export function createSwapRoutes(auctionService: AuctionService): Router {
   const router = Router();
   
-  // Create a new swap auction
+  // Step 2: User submits swap order, signature, secret to relayer service
   router.post("/create-swap", async (req: Request, res: Response) => {
     try {
-      const { swapRequest, secret }: { swapRequest: SwapRequest; secret: string } = req.body;
+      const { 
+        swapRequest, 
+        signature, 
+        secret 
+      }: { 
+        swapRequest: SwapRequest; 
+        signature: string;
+        secret: string;
+      } = req.body;
       
-      // Validate swap request
-      if (!swapRequest || !secret) {
-        return res.status(400).json({ error: "Missing swap request or secret" });
+      // Validate all required fields
+      if (!swapRequest || !signature || !secret) {
+        return res.status(400).json({ 
+          error: "Missing required fields: swapRequest, signature, or secret" 
+        });
       }
       
-      // Verify signature (simplified for demo)
-      // In production, verify the signature matches the swap request
+      // Verify signature matches the swap request
+      // TODO: Implement proper signature verification
       
-      // Create order
-      const order = await auctionService.createOrder(swapRequest, secret);
+      // Create order with secret stored securely
+      const order = await auctionService.createOrder(swapRequest, signature, secret);
       
       res.json({
         success: true,
         orderId: order.orderId,
         marketPrice: order.marketPrice,
-        expiresAt: order.expiresAt
+        expiresAt: order.expiresAt,
+        message: "Order created and broadcasted to resolvers with secret hash only"
       });
       
     } catch (error: any) {
@@ -160,6 +171,47 @@ export function createSwapRoutes(auctionService: AuctionService): Router {
     }
   });
   
+  // Resolver commits to rescue a failed order
+  router.post("/rescue-order", async (req: Request, res: Response) => {
+    try {
+      const { orderId, resolverAddress }: { orderId: string; resolverAddress: string } = req.body;
+      
+      if (!orderId || !resolverAddress) {
+        return res.status(400).json({ error: "Missing orderId or resolverAddress" });
+      }
+      
+      const order = auctionService.getOrder(orderId);
+      if (!order) {
+        return res.status(404).json({ error: "Order not found" });
+      }
+      
+      if (order.status !== "rescue_available") {
+        return res.status(400).json({ error: "Order is not available for rescue" });
+      }
+      
+      // Allow rescue commitment - similar to normal commitment but with rescue rewards
+      const rescueCommitment: ResolverCommitment = {
+        orderId,
+        resolverAddress,
+        acceptedPrice: order.committedPrice || order.marketPrice,
+        timestamp: Date.now()
+      };
+      
+      const result = await auctionService.commitResolver(rescueCommitment);
+      
+      res.json({
+        ...result,
+        message: "Rescue commitment accepted. You can claim original resolver's safety deposits.",
+        originalResolver: order.resolver,
+        rewardInfo: "Complete the trade to claim safety deposits as penalty reward"
+      });
+      
+    } catch (error: any) {
+      console.error("[API] Error processing rescue commitment:", error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
   // Legacy endpoint redirect
   router.get("/active-auctions", (req: Request, res: Response) => {
     res.redirect("/api/active-orders");
