@@ -1,13 +1,15 @@
-# Unite Relayer Service
+# Cross-Chain Swap Relayer Service
 
-A gasless cross-chain swap relayer service for the Unite DeFi protocol.
+A centralized relayer service that orchestrates gasless cross-chain token swaps between users and resolvers.
 
 ## Overview
 
-The Unite Relayer enables gasless cross-chain swaps by:
-- Managing Dutch auction-based price discovery
-- Orchestrating HTLC-based atomic settlements
-- Enabling users to swap with only one-time token approvals
+The Relayer Service coordinates cross-chain swaps by:
+- Broadcasting user swap orders to registered resolvers
+- Managing resolver commitments and 5-minute execution timers
+- Orchestrating escrow deployments and fund transfers
+- Revealing secrets to complete atomic swaps
+- Handling rescue mechanisms for failed orders
 
 ## Quick Start
 
