@@ -78,6 +78,61 @@ export class BlockchainService {
     }
   }
   
+  async registerOrderInRelayerContract(
+    chainId: number,
+    orderId: string,
+    userAddress: string,
+    tokenAddress: string,
+    amount: string,
+    secretHash: string
+  ): Promise<string> {
+    const provider = this.providers.get(chainId);
+    const wallet = this.wallets.get(chainId);
+    
+    if (!provider || !wallet) {
+      throw new Error(`Chain ${chainId} not configured`);
+    }
+    
+    // Get relayer contract address
+    const relayerContract = this.getRelayerContract(chainId);
+    
+    // ABI for the RelayerContract registerOrder function
+    const RELAYER_ABI = [
+      "function registerOrder(bytes32 orderId, address user, address srcToken, uint256 amount, bytes32 secretHash) external"
+    ];
+    
+    const contract = new ethers.Contract(relayerContract, RELAYER_ABI, wallet);
+    
+    try {
+      console.log(`[Blockchain] Registering order in RelayerContract:`, {
+        orderId,
+        user: userAddress,
+        token: tokenAddress,
+        amount,
+        secretHash
+      });
+      
+      const tx = await contract.registerOrder(
+        orderId,
+        userAddress,
+        tokenAddress,
+        amount,
+        secretHash
+      );
+      
+      console.log(`[Blockchain] Registration TX: ${tx.hash}`);
+      
+      // Wait for confirmation
+      const receipt = await tx.wait();
+      console.log(`[Blockchain] Registration confirmed in block ${receipt.blockNumber}`);
+      
+      return tx.hash;
+    } catch (error) {
+      console.error("[Blockchain] Order registration failed:", error);
+      throw new Error(`Failed to register order: ${error.message}`);
+    }
+  }
+  
   async verifyEscrowWithDeposit(
     chainId: number,
     escrowAddress: string,
@@ -91,11 +146,9 @@ export class BlockchainService {
     return true;
   }
   
-  async transferUserFundsViaRelayer(
+  async transferUserFundsViaRelayerContract(
     chainId: number,
-    userAddress: string,
-    tokenAddress: string,
-    amount: string,
+    orderId: string,
     escrowAddress: string
   ): Promise<string> {
     const provider = this.providers.get(chainId);
@@ -105,42 +158,34 @@ export class BlockchainService {
       throw new Error(`Chain ${chainId} not configured`);
     }
     
-    console.log("[Blockchain] Transferring user funds via relayer:", {
-      user: userAddress,
-      token: tokenAddress,
-      amount: amount,
+    console.log("[Blockchain] Step 7: Transferring user funds via RelayerContract:", {
+      orderId,
       escrow: escrowAddress
     });
     
     // Get relayer contract address
     const relayerContract = this.getRelayerContract(chainId);
     
-    // ABI for the actual RelayerContract
+    // ABI for the RelayerContract transferUserFundsToEscrow function
     const RELAYER_ABI = [
-      "function transferUserFundsToEscrow(bytes32 orderId, address escrowAddress) external",
-      "function registerOrder(bytes32 orderId, address user, address token, uint256 amount, bytes32 secretHash) external"
+      "function transferUserFundsToEscrow(bytes32 orderId, address escrowAddress) external"
     ];
     
     const contract = new ethers.Contract(relayerContract, RELAYER_ABI, wallet);
     
-    // Generate orderId from user and timestamp
-    const orderId = ethers.keccak256(
-      ethers.toUtf8Bytes(`order_${userAddress}_${Date.now()}`)
-    );
-    
     try {
-      // Call the actual contract function
+      // Call the RelayerContract to transfer user's pre-approved funds to escrow
       const tx = await contract.transferUserFundsToEscrow(orderId, escrowAddress);
-      console.log(`[Blockchain] Transfer TX: ${tx.hash}`);
+      console.log(`[Blockchain] Step 7 Transfer TX: ${tx.hash}`);
       
       // Wait for confirmation
       const receipt = await tx.wait();
-      console.log(`[Blockchain] Transfer confirmed in block ${receipt.blockNumber}`);
+      console.log(`[Blockchain] Step 7 Transfer confirmed in block ${receipt.blockNumber}`);
       
       return tx.hash;
     } catch (error) {
-      console.error("[Blockchain] Transfer failed:", error);
-      throw new Error(`Failed to transfer user funds: ${error.message}`);
+      console.error("[Blockchain] Step 7 Transfer failed:", error);
+      throw new Error(`Failed to transfer user funds via RelayerContract: ${error.message}`);
     }
   }
   
