@@ -1,16 +1,22 @@
 import { ethers } from "ethers";
-import { OrderData, SwapRequest, ResolverCommitment, SettlementNotification, EscrowReadyNotification } from "../types";
+import { OrderData, SwapRequest, ResolverCommitment, SettlementNotification, EscrowReadyNotification, HTLCOrder } from "../types";
 import { BlockchainService } from "./blockchain.service";
+import { SQSService } from "./sqs.service";
+import { DatabaseService } from "./database.service";
+import { DutchAuctionService, DutchAuctionParams } from "./dutch-auction.service";
+import { EIP712Utils } from "../utils/eip712.utils";
 import { config } from "../config";
 
 export class AuctionService {
-  private orders: Map<string, OrderData> = new Map();
   private blockchainService: BlockchainService;
-  private userSecrets: Map<string, string> = new Map();
+  private sqsService: SQSService;
+  private databaseService: DatabaseService;
   private marketPrices: Map<string, string> = new Map(); // Mock price oracle
   
-  constructor(blockchainService: BlockchainService) {
+  constructor(blockchainService: BlockchainService, sqsService: SQSService, databaseService: DatabaseService) {
     this.blockchainService = blockchainService;
+    this.sqsService = sqsService;
+    this.databaseService = databaseService;
     
     // Initialize mock market prices
     this.marketPrices.set("USDT-DAI", "1000000"); // 1:1 for stablecoins
@@ -20,54 +26,91 @@ export class AuctionService {
     
     // Start background task to check expired orders and rescue opportunities
     setInterval(() => this.checkExpiredOrders(), 10000); // Every 10 seconds
+    
+    // Start background task to clean up old orders (once per day)
+    setInterval(() => this.cleanupOldOrders(), 24 * 60 * 60 * 1000); // Every 24 hours
   }
   
   async createOrder(swapRequest: SwapRequest, signature: string, secret: string): Promise<OrderData> {
-    // Generate order ID
-    const orderId = ethers.keccak256(
-      ethers.toUtf8Bytes(`order_${swapRequest.userAddress}_${Date.now()}`)
+    // Convert SwapRequest to HTLCOrder format for EIP-712
+    const htlcOrder = EIP712Utils.createHTLCOrder(
+      swapRequest.userAddress,
+      swapRequest.srcChainId,
+      swapRequest.srcToken,
+      swapRequest.srcAmount,
+      swapRequest.dstChainId,
+      swapRequest.dstToken,
+      swapRequest.secretHash,
+      swapRequest.minAcceptablePrice,
+      swapRequest.orderDuration
     );
     
+    // Verify EIP-712 signature
+    const verifyingContract = config.chains[swapRequest.srcChainId]?.escrowFactory || ethers.ZeroAddress;
+    const isValidSignature = EIP712Utils.verifySignature(
+      htlcOrder,
+      signature,
+      swapRequest.userAddress,
+      swapRequest.srcChainId,
+      verifyingContract
+    );
+    
+    if (!isValidSignature) {
+      throw new Error("Invalid EIP-712 signature");
+    }
+    
+    // Generate order ID from EIP-712 hash
+    const domain = EIP712Utils.getDomain(swapRequest.srcChainId, verifyingContract);
+    const orderId = EIP712Utils.getOrderHash(htlcOrder, domain);
+    
+    console.log(`[Order] Verified EIP-712 signature for order ${orderId}`);
+    
     // Verify secret hash matches
-    const computedHash = ethers.keccak256(secret);
+    const secretBytes32 = ethers.encodeBytes32String(secret);
+    const computedHash = ethers.keccak256(secretBytes32);
+    
     if (computedHash !== swapRequest.secretHash) {
+      console.error(`[Order] Secret hash mismatch! Expected: ${swapRequest.secretHash}, Got: ${computedHash}`);
       throw new Error("Secret hash mismatch");
     }
     
-    // Store secret securely (in production, use secure storage)
-    this.userSecrets.set(orderId, secret);
+    // Store secret securely in database
+    await this.databaseService.saveSecret(orderId, swapRequest.secretHash, secret);
     
-    // Step 1 Verification: Check user has approved relayer contract
+    // Step 1 Verification: Check user has approved UniteEscrowFactory
+    const escrowFactory = config.chains[swapRequest.srcChainId]?.escrowFactory;
+    if (!escrowFactory) {
+      throw new Error(`No escrow factory configured for chain ${swapRequest.srcChainId}`);
+    }
+    
     const approvedAmount = await this.blockchainService.checkAllowance(
       swapRequest.srcChainId,
       swapRequest.srcToken,
       swapRequest.userAddress,
-      this.blockchainService.getRelayerContract(swapRequest.srcChainId)
+      escrowFactory
     );
     
     if (BigInt(approvedAmount) < BigInt(swapRequest.srcAmount)) {
-      throw new Error("Insufficient allowance. User must approve relayer contract first (Step 1).");
+      throw new Error("Insufficient allowance. User must approve UniteEscrowFactory first (Step 1).");
     }
     
-    // Register order in RelayerContract (Step 2)
-    try {
-      await this.blockchainService.registerOrderInRelayerContract(
-        swapRequest.srcChainId,
-        orderId,
-        swapRequest.userAddress,
-        swapRequest.srcToken,
-        swapRequest.srcAmount,
-        swapRequest.secretHash
-      );
-      console.log(`[Order] Registered order ${orderId} in RelayerContract`);
-    } catch (error) {
-      console.error(`[Order] Failed to register order in RelayerContract:`, error);
-      throw new Error("Failed to register order in RelayerContract");
-    }
+    console.log(`[Order] User has approved ${approvedAmount} tokens to UniteEscrowFactory`);
     
     // Get current market price
     const pairKey = `${swapRequest.srcToken}-${swapRequest.dstToken}`;
     const marketPrice = this.marketPrices.get(pairKey) || swapRequest.minAcceptablePrice;
+    
+    // Calculate Dutch auction parameters using the pricing service
+    const auctionParams = DutchAuctionService.createAuctionParams(
+      swapRequest.minAcceptablePrice,
+      marketPrice,
+      swapRequest.orderDuration
+    );
+    
+    // Extract values for backward compatibility
+    const auctionStartPrice = auctionParams.startPrice;
+    const auctionEndPrice = auctionParams.endPrice;
+    const auctionDuration = auctionParams.duration;
     
     // Create order data
     const orderData: OrderData = {
@@ -76,23 +119,26 @@ export class AuctionService {
       marketPrice,
       status: "active",
       createdAt: Date.now(),
-      expiresAt: Date.now() + (swapRequest.orderDuration * 1000)
+      expiresAt: Date.now() + (swapRequest.orderDuration * 1000),
+      auctionStartPrice,
+      auctionEndPrice,
+      auctionDuration
     };
     
     console.log(`[Order] Created order ${orderId}`);
     console.log(`[Order] Market price: ${marketPrice}`);
     console.log(`[Order] Signature: ${signature.substring(0, 10)}...`);
     
-    // Store order
-    this.orders.set(orderId, orderData);
+    // Store order in database
+    await this.databaseService.saveOrder(orderData);
     
     // Step 3: Broadcast to resolvers with secret hash only (not the secret)
-    this.broadcastOrderToResolvers(orderData);
+    await this.broadcastOrderToResolvers(orderData);
     
     return orderData;
   }
   
-  private broadcastOrderToResolvers(order: OrderData) {
+  private async broadcastOrderToResolvers(order: OrderData) {
     console.log(`[Order] Broadcasting order ${order.orderId} to resolvers`);
     console.log(`[Order] Broadcast details:`, {
       orderId: order.orderId,
@@ -107,12 +153,24 @@ export class AuctionService {
       expiresAt: order.expiresAt
     });
     
-    // In production, this would send to all connected resolvers via WebSocket
-    // For now, resolvers can poll /api/active-orders endpoint
+    // Broadcast order to SQS for resolvers to consume
+    try {
+      await this.sqsService.broadcastOrder(
+        order.orderId,
+        order,
+        order.auctionStartPrice,
+        order.auctionEndPrice,
+        order.auctionDuration
+      );
+      console.log(`[Order] Successfully broadcasted order ${order.orderId} to SQS`);
+    } catch (error) {
+      console.error(`[Order] Failed to broadcast order ${order.orderId} to SQS:`, error);
+      throw error;
+    }
   }
   
-  async commitResolver(commitment: ResolverCommitment): Promise<{ success: boolean }> {
-    const order = this.orders.get(commitment.orderId);
+  async commitResolver(commitment: ResolverCommitment): Promise<{ success: boolean; currentPrice?: string; expectedDstAmount?: string }> {
+    const order = await this.databaseService.getOrder(commitment.orderId);
     if (!order) {
       throw new Error("Order not found");
     }
@@ -121,6 +179,33 @@ export class AuctionService {
       throw new Error("Order already committed or completed");
     }
     
+    // Validate resolver's accepted price against current auction price
+    const auctionParams: DutchAuctionParams = {
+      startPrice: order.auctionStartPrice,
+      endPrice: order.auctionEndPrice,
+      startTime: order.createdAt,
+      duration: order.auctionDuration
+    };
+    
+    const validation = DutchAuctionService.validateResolverPrice(
+      auctionParams,
+      commitment.acceptedPrice,
+      Date.now()
+    );
+    
+    if (!validation.valid) {
+      throw new Error(`Invalid price: ${validation.reason}`);
+    }
+    
+    // Calculate the exact amounts based on accepted price
+    // For stablecoins, assume 6 decimals (USDT, USDC, DAI)
+    const tokenAmounts = DutchAuctionService.calculateTokenAmounts(
+      order.swapRequest.srcAmount,
+      6, // src token decimals
+      6, // dst token decimals
+      commitment.acceptedPrice
+    );
+    
     // Update order with resolver commitment
     order.status = "committed";
     order.resolver = commitment.resolverAddress;
@@ -128,14 +213,26 @@ export class AuctionService {
     order.commitmentTime = Date.now();
     order.commitmentDeadline = Date.now() + 5 * 60 * 1000; // 5 minutes
     
+    // Save to database
+    await this.databaseService.saveOrder(order);
+    
+    // Save resolver commitment for audit trail
+    await this.databaseService.saveResolverCommitment(commitment);
+    
     console.log(`[Order] Resolver ${commitment.resolverAddress} committed to order ${commitment.orderId}`);
+    console.log(`[Order] Accepted price: ${DutchAuctionService.formatPrice(commitment.acceptedPrice)}`);
+    console.log(`[Order] User will receive: ${tokenAmounts.makerAmount} dst tokens`);
     console.log(`[Order] 5-minute timer started. Deadline: ${new Date(order.commitmentDeadline).toISOString()}`);
     
-    return { success: true };
+    return { 
+      success: true,
+      currentPrice: commitment.acceptedPrice,
+      expectedDstAmount: tokenAmounts.makerAmount
+    };
   }
   
   async escrowsReady(notification: EscrowReadyNotification): Promise<void> {
-    const order = this.orders.get(notification.orderId);
+    const order = await this.databaseService.getOrder(notification.orderId);
     if (!order) {
       throw new Error("Order not found");
     }
@@ -169,6 +266,9 @@ export class AuctionService {
     order.srcEscrowAddress = notification.srcEscrowAddress;
     order.dstEscrowAddress = notification.dstEscrowAddress;
     
+    // Save to database
+    await this.databaseService.saveOrder(order);
+    
     console.log(`[Order] Escrows ready for order ${notification.orderId}`);
     
     // Start user funds transfer
@@ -176,7 +276,7 @@ export class AuctionService {
   }
   
   async moveUserFunds(orderId: string): Promise<string> {
-    const order = this.orders.get(orderId);
+    const order = await this.databaseService.getOrder(orderId);
     if (!order) {
       throw new Error("Order not found");
     }
@@ -185,12 +285,14 @@ export class AuctionService {
       throw new Error("Source escrow not set");
     }
     
-    // Step 7: Relayer transfers user's pre-approved funds to source escrow via RelayerContract
+    // Step 7: Relayer transfers user's pre-approved funds to source escrow via UniteEscrowFactory
     console.log(`[Order] Step 7: Moving user funds to source escrow for order ${orderId}`);
     
-    const txHash = await this.blockchainService.transferUserFundsViaRelayerContract(
+    const txHash = await this.blockchainService.transferUserFundsToEscrow(
       order.swapRequest.srcChainId,
-      orderId,
+      order.swapRequest.userAddress,
+      order.swapRequest.srcToken,
+      order.swapRequest.srcAmount,
       order.srcEscrowAddress
     );
     
@@ -202,13 +304,16 @@ export class AuctionService {
     }
     order.settlementTx.srcChainTxHash = txHash;
     
+    // Save to database
+    await this.databaseService.saveOrder(order);
+    
     console.log(`[Order] Step 7 Complete: User funds moved to escrow for order ${orderId}`);
     
     return txHash;
   }
   
   async notifySettlement(notification: SettlementNotification): Promise<void> {
-    const order = this.orders.get(notification.orderId);
+    const order = await this.databaseService.getOrder(notification.orderId);
     if (!order) {
       throw new Error("Order not found");
     }
@@ -239,6 +344,9 @@ export class AuctionService {
     }
     order.settlementTx.dstChainTxHash = notification.dstTxHash;
     
+    // Save to database
+    await this.databaseService.saveOrder(order);
+    
     console.log(`[Order] Resolver notified settlement for order ${notification.orderId}`);
     
     // Start settlement finalization process
@@ -246,7 +354,7 @@ export class AuctionService {
   }
   
   private async finalizeSettlement(orderId: string): Promise<void> {
-    const order = this.orders.get(orderId);
+    const order = await this.databaseService.getOrder(orderId);
     if (!order || !order.settlementTx) {
       return;
     }
@@ -280,7 +388,7 @@ export class AuctionService {
       
       // Step 9: Relayer reveals secret on destination chain
       // This unlocks funds for user and returns safety deposit to resolver
-      const secret = this.userSecrets.get(orderId);
+      const secret = await this.databaseService.getSecret(orderId);
       if (!secret) {
         throw new Error("Secret not found");
       }
@@ -299,44 +407,67 @@ export class AuctionService {
       // Update order status
       order.status = "completed";
       order.secretRevealedAt = Date.now();
+      order.secretRevealTxHash = revealTxHash;
+      
+      // Save to database
+      await this.databaseService.saveOrder(order);
+      
+      // Mark secret as revealed
+      await this.databaseService.markSecretRevealed(orderId);
+      
+      // Update resolver commitment status
+      if (order.resolver) {
+        await this.databaseService.updateCommitmentStatus(orderId, order.resolver, "completed");
+      }
       
       console.log(`[Order] Step 9 Complete: Secret revealed, user and resolver can now claim funds`);
       console.log(`[Order] Step 10: Resolver can now use the same secret to withdraw from source chain`);
-      
-      // Clean up secret from memory (resolver now has access via blockchain)
-      this.userSecrets.delete(orderId);
       
       console.log(`[Order] Order ${orderId} completed successfully!`);
       
     } catch (error) {
       console.error(`[Order] Error in Step 9 (finalizing settlement) for ${orderId}:`, error);
       order.status = "failed";
+      await this.databaseService.saveOrder(order);
+      
+      // Update resolver commitment status if applicable
+      if (order.resolver) {
+        await this.databaseService.updateCommitmentStatus(orderId, order.resolver, "failed");
+      }
     }
   }
   
-  private checkExpiredOrders(): void {
+  private async checkExpiredOrders(): Promise<void> {
     const now = Date.now();
     
-    for (const [orderId, order] of this.orders) {
-      // Check if order expired without commitment
-      if (order.status === "active" && order.expiresAt < now) {
-        console.log(`[Order] Order ${orderId} expired`);
-        order.status = "failed";
-      }
+    // Check expired active orders
+    const expiredOrders = await this.databaseService.getExpiredOrders(now);
+    for (const order of expiredOrders) {
+      console.log(`[Order] Order ${order.orderId} expired`);
+      order.status = "failed";
+      await this.databaseService.saveOrder(order);
+    }
+    
+    // Check orders with expired commitments
+    const expiredCommitments = await this.databaseService.getOrdersWithExpiredCommitments(now);
+    for (const order of expiredCommitments) {
+      console.log(`[Order] Resolver failed to complete order ${order.orderId} in 5-minute window`);
+      order.status = "rescue_available";
+      await this.databaseService.saveOrder(order);
       
-      // Check if resolver failed to complete in 5-minute window
-      if (order.status === "committed" && 
-          order.commitmentDeadline && 
-          order.commitmentDeadline < now) {
-        console.log(`[Order] Resolver failed to complete order ${orderId} in 5-minute window`);
-        order.status = "rescue_available";
-        // Order is now available for any resolver to rescue
-        this.broadcastRescueOpportunity(order);
-      }
+      // Order is now available for any resolver to rescue
+      await this.broadcastRescueOpportunity(order);
+    }
+    
+    // Check orders pending secret reveal
+    const pendingReveal = await this.databaseService.getOrdersPendingSecretReveal(now);
+    for (const order of pendingReveal) {
+      console.log(`[Order] Auto-revealing secret for order ${order.orderId} due to timeout`);
+      await this.finalizeSettlement(order.orderId);
     }
   }
   
-  private broadcastRescueOpportunity(order: OrderData) {
+  private async broadcastRescueOpportunity(order: OrderData): Promise<void> {
     console.log(`[Order] Broadcasting rescue opportunity for order ${order.orderId}`);
     console.log(`[Order] Original resolver ${order.resolver} forfeits safety deposits`);
     console.log(`[Order] Rescue details:`, {
@@ -357,12 +488,12 @@ export class AuctionService {
     // 4. The relayer will reveal the secret to unlock user funds
   }
   
-  getOrder(orderId: string): OrderData | undefined {
-    return this.orders.get(orderId);
+  async getOrder(orderId: string): Promise<OrderData | null> {
+    return await this.databaseService.getOrder(orderId);
   }
   
-  getOrderStatus(orderId: string): any {
-    const order = this.orders.get(orderId);
+  async getOrderStatus(orderId: string): Promise<any> {
+    const order = await this.databaseService.getOrder(orderId);
     if (!order) return null;
     
     return {
@@ -377,8 +508,82 @@ export class AuctionService {
     };
   }
   
-  getAllActiveOrders(): OrderData[] {
-    return Array.from(this.orders.values())
-      .filter(order => order.status === "active" || order.status === "rescue_available");
+  async getAllActiveOrders(): Promise<OrderData[]> {
+    return await this.databaseService.getAllActiveOrders();
+  }
+  
+  async getRevealedSecretInfo(orderId: string): Promise<{ revealTxHash: string; revealedAt: number } | null> {
+    const order = await this.databaseService.getOrder(orderId);
+    if (!order || order.status !== "completed" || !order.secretRevealTxHash) {
+      return null;
+    }
+    
+    return {
+      revealTxHash: order.secretRevealTxHash,
+      revealedAt: order.secretRevealedAt || 0
+    };
+  }
+  
+  /**
+   * Get current price and details for an active order's Dutch auction
+   */
+  async getCurrentAuctionPrice(orderId: string): Promise<any> {
+    const order = await this.databaseService.getOrder(orderId);
+    if (!order || order.status !== "active") {
+      return null;
+    }
+    
+    const auctionParams: DutchAuctionParams = {
+      startPrice: order.auctionStartPrice,
+      endPrice: order.auctionEndPrice,
+      startTime: order.createdAt,
+      duration: order.auctionDuration
+    };
+    
+    const priceCalc = DutchAuctionService.getFullPriceCalculation(
+      auctionParams,
+      order.swapRequest.srcAmount,
+      6, // src token decimals
+      6, // dst token decimals
+      Date.now()
+    );
+    
+    const timeRemaining = DutchAuctionService.getTimeRemaining(auctionParams);
+    
+    return {
+      orderId: order.orderId,
+      currentPrice: priceCalc.currentPrice,
+      formattedPrice: DutchAuctionService.formatPrice(priceCalc.currentPrice),
+      makerAmount: priceCalc.makerAmount,
+      takerAmount: priceCalc.takerAmount,
+      priceImprovement: priceCalc.priceImprovement,
+      timeElapsed: priceCalc.timeElapsed,
+      timeRemaining,
+      isExpired: priceCalc.isExpired,
+      auctionParams: {
+        startPrice: order.auctionStartPrice,
+        endPrice: order.auctionEndPrice,
+        duration: order.auctionDuration
+      }
+    };
+  }
+  
+  // Database statistics
+  async getOrderStats(): Promise<any> {
+    return await this.databaseService.getOrderStats();
+  }
+  
+  async getResolverStats(resolverAddress: string): Promise<any> {
+    return await this.databaseService.getResolverStats(resolverAddress);
+  }
+  
+  // Cleanup old orders
+  private async cleanupOldOrders(): Promise<void> {
+    try {
+      const deletedCount = await this.databaseService.cleanupOldOrders(30); // Keep 30 days
+      console.log(`[Order] Cleanup completed: ${deletedCount} old orders removed`);
+    } catch (error) {
+      console.error("[Order] Error during cleanup:", error);
+    }
   }
 }
