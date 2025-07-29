@@ -46,3 +46,10 @@ artifacts/
 *.temp
 gasless_deployments.json
 crosschain_deployments.json
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+data/
+test-relayer.db
