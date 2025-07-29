@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash",
+      "Bash(mkdir:*)",
+      "Bash(touch:*)",
+      "mcp__browser-automation__puppeteer_navigate",
+      "mcp__browser-automation__puppeteer_screenshot",
+      "mcp__browser-automation__puppeteer_click",
+      "mcp__browser-automation__puppeteer_evaluate"
+    ],
+    "deny": []
+  }
+}
