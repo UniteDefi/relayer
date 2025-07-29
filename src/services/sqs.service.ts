@@ -21,29 +21,31 @@ export interface SQSOrderMessage {
 
 export class SQSService {
   private sqsClient: SQSClient;
-  private queueUrl: string | null = null;
-  private readonly queueName: string = "unite-defi-orders.fifo";
-  
+  private queueUrl: string = "https://sqs.us-east-1.amazonaws.com/112639119226/BridgeIntentQueue";
+  private readonly queueName: string = "BridgeIntentQueue";
+
   constructor() {
     const sqsConfig: SQSClientConfig = {
       region: config.aws?.region || "us-east-1",
-      credentials: config.aws?.credentials ? {
-        accessKeyId: config.aws.credentials.accessKeyId,
-        secretAccessKey: config.aws.credentials.secretAccessKey
-      } : undefined
+      credentials: config.aws?.credentials
+        ? {
+            accessKeyId: config.aws.credentials.accessKeyId,
+            secretAccessKey: config.aws.credentials.secretAccessKey
+          }
+        : undefined
     };
-    
+
     this.sqsClient = new SQSClient(sqsConfig);
     console.log("[SQS] Initialized SQS client for region:", sqsConfig.region);
   }
-  
+
   async initialize(): Promise<void> {
     try {
       // Try to get existing queue URL
       const getQueueUrlCommand = new GetQueueUrlCommand({
         QueueName: this.queueName
       });
-      
+
       try {
         const response = await this.sqsClient.send(getQueueUrlCommand);
         this.queueUrl = response.QueueUrl!;
@@ -62,7 +64,7 @@ export class SQSService {
       throw error;
     }
   }
-  
+
   private async createQueue(): Promise<void> {
     const createQueueCommand = new CreateQueueCommand({
       QueueName: this.queueName,
@@ -78,12 +80,12 @@ export class SQSService {
         ReceiveMessageWaitTimeSeconds: "20"
       }
     });
-    
+
     const response = await this.sqsClient.send(createQueueCommand);
     this.queueUrl = response.QueueUrl!;
     console.log("[SQS] Created new FIFO queue:", this.queueUrl);
   }
-  
+
   async broadcastOrder(
     orderId: string,
     orderData: OrderData,
@@ -94,7 +96,7 @@ export class SQSService {
     if (!this.queueUrl) {
       throw new Error("SQS queue not initialized");
     }
-    
+
     const message: SQSOrderMessage = {
       orderId,
       orderData,
@@ -103,7 +105,7 @@ export class SQSService {
       auctionEndPrice,
       auctionDuration
     };
-    
+
     const params: SendMessageCommandInput = {
       QueueUrl: this.queueUrl,
       MessageBody: JSON.stringify(message),
@@ -111,7 +113,7 @@ export class SQSService {
       MessageGroupId: "orders", // All orders in same group for ordering
       MessageDeduplicationId: orderId // Use order ID for deduplication
     };
-    
+
     try {
       const command = new SendMessageCommand(params);
       const response = await this.sqsClient.send(command);
@@ -121,7 +123,7 @@ export class SQSService {
       throw error;
     }
   }
-  
+
   async getQueueUrl(): Promise<string> {
     if (!this.queueUrl) {
       await this.initialize();
