@@ -1,0 +1,84 @@
+{
+  "evm": {
+    "eth_sepolia": {
+      "chainId": 11155111,
+      "name": "Ethereum Sepolia",
+      "MockWrappedNative": "0x6a0cf7e7424bf22a780726bac57fd5a442b025a6",
+      "MockERC20": "0x8465d8d2c0a3228ddbfa8b0c495cd14d2dbee8ac",
+      "MockERC20_2": "0x0da822fd04de975b2918ed62b11e9b85460b92ca",
+      "LimitOrderProtocol": "0x8cc6b52c569c3c0568232e40255d1e95de416067",
+      "UniteEscrowFactory": "0xc5268765e591e303e97fb0aec139cbb764b96df2",
+      "Resolver": "0x8fb4a80bacabe982ec1382ec9f032a53df0d88dd",
+      "Resolver_2": "0xcc14100211626d4d6fc8751fb62c16a7d5be502f",
+      "Resolver_3": "0x4888dc936f9b9e398fd3b63ab2a6906f5caec795",
+      "Resolver_4": "0x7dac24e18114010de3b17a59dd2000df646cc8a6"
+    },
+    "base_sepolia": {
+      "chainId": 84532,
+      "name": "Base Sepolia",
+      "MockWrappedNative": "0x8fb4a80bacabe982ec1382ec9f032a53df0d88dd",
+      "MockERC20": "0xcc14100211626d4d6fc8751fb62c16a7d5be502f",
+      "MockERC20_2": "0x4888dc936f9b9e398fd3b63ab2a6906f5caec795",
+      "LimitOrderProtocol": "0x7dac24e18114010de3b17a59dd2000df646cc8a6",
+      "UniteEscrowFactory": "0x82aaa15a37fd115e11246a2d5d732629af15e9d1",
+      "Resolver": "0x7d76c0d417310e5c0dd8a81fb5a651a7de3cd670",
+      "Resolver_2": "0xbd2e176ed6b17802f139d3c4bb5557d5c0ef8f50",
+      "Resolver_3": "0x0b6fb370e9323ce7e97e2f2e7572f7ee24d51deb",
+      "Resolver_4": "0x891ca74824a64fc59a4c4d77fdd97908ec3c99ed"
+    },
+    "arb_sepolia": {
+      "chainId": 421614,
+      "name": "Arbitrum Sepolia",
+      "MockWrappedNative": "0x972e9d410d1e45b273a76058fda2ae87e2774ba5",
+      "MockERC20": "0x15203c110ea8f48ac4216af44c6690a378993540",
+      "MockERC20_2": "0xa0db2578292a24714c8c905556ebbebb962152c5",
+      "LimitOrderProtocol": "0x9226178df0286e0d6c8f690dfcd9f3ed606881d4",
+      "UniteEscrowFactory": "0x3722cc2778acdf236a8066b7fad7a5dcdb1cc7c1",
+      "Resolver": "0x3ca6e8712e4aeaaee1c0c74e21cc5299ac40475d",
+      "Resolver_2": "0x0361d3c7c5c1f236f507453086cde18d12dd76e3",
+      "Resolver_3": "0x81cc67ed241c9ed3142a45eff844957de2b37877",
+      "Resolver_4": "0x3096ca722e2343664f5cead66e1a8bdf763dd8c2"
+    },
+    "monad_testnet": {
+      "chainId": 10143,
+      "name": "Monad Testnet",
+      "MockWrappedNative": "0xc6ae2bba9d56eaaa3b932341434a842afc797e1c",
+      "MockERC20": "0x1efa70cebaee4a28e3338ed7d316a28ce6e1d4f9",
+      "MockERC20_2": "0x9fdb806b9a7fa4bf00483af2898ae16ef01f5960",
+      "LimitOrderProtocol": "0x24f3d8f14f3bbe654d453a72dd9db6fd019a196e",
+      "UniteEscrowFactory": "0x9883a9330d1b0dab45c9747d57ca8bd2c532549e",
+      "Resolver": "0x5e9517b4b790117e67d569472d8ccb83aa4426e4",
+      "Resolver_2": "0xf6bbcf06ceb067fbb9a97fb2d04004acb442bb92",
+      "Resolver_3": "0x63f7888a08526b725b7274b9318034d87c8283b7",
+      "Resolver_4": "0x10568cf1240cb275eb406bf5c6a38a416c557306"
+    }
+  },
+  "aptos": {
+    "testnet": {
+      "network": "aptos-testnet",
+      "escrowFactory": "0x1234567890abcdef",
+      "relayerContract": "0xabcdef1234567890"
+    }
+  },
+  "sui": {
+    "testnet": {
+      "network": "sui-testnet",
+      "escrowFactory": "0x1234567890abcdef",
+      "relayerContract": "0xabcdef1234567890"
+    }
+  },
+  "near": {
+    "testnet": {
+      "network": "near-testnet",
+      "escrowFactory": "escrow-factory.testnet",
+      "relayerContract": "relayer.testnet"
+    }
+  },
+  "tron": {
+    "testnet": {
+      "network": "tron-shasta",
+      "escrowFactory": "TXYZabcdef1234567890",
+      "relayerContract": "TXYZabcdef0987654321"
+    }
+  }
+}
