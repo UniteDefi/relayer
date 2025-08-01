@@ -1,6 +1,6 @@
 import { Router, Request, Response } from "express";
 import { AuctionService } from "../services/auction.service";
-import { SwapRequest, ResolverCommitment, SettlementNotification, EscrowReadyNotification, HTLCOrder } from "../types";
+import { SwapRequest, CreateSwapRequest, ResolverCommitment, SettlementNotification, EscrowReadyNotification, HTLCOrder } from "../types";
 import { ethers } from "ethers";
 import { EIP712Utils } from "../utils/eip712.utils";
 import { config } from "../config";
@@ -12,41 +12,64 @@ export function createSwapRoutes(auctionService: AuctionService): Router {
   router.post("/create-swap", async (req: Request, res: Response) => {
     try {
       const { 
-        swapRequest, 
+        htlcOrder, 
         signature, 
-        secret 
-      }: { 
-        swapRequest: SwapRequest; 
-        signature: string;
-        secret: string;
+        secret,
+        sdkOrder 
       } = req.body;
       
-      // Validate all required fields
-      if (!swapRequest || !signature || !secret) {
+      // Check if this is an SDK-based order
+      if (sdkOrder && sdkOrder.orderData) {
+        console.log("[API] Processing SDK-based cross-chain order");
+        
+        // Create order from SDK format
+        const order = await auctionService.createOrderFromSDK(
+          sdkOrder.orderData,
+          sdkOrder.orderHash,
+          sdkOrder.extension,
+          signature,
+          secret,
+          htlcOrder // Still need HTLC order for metadata
+        );
+        
+        res.json({
+          success: true,
+          orderId: order.orderId,
+          marketPrice: order.marketPrice,
+          expiresAt: order.expiresAt,
+          message: "SDK cross-chain order created and broadcasted to resolvers"
+        });
+        
+      } else if (htlcOrder && signature && secret) {
+        // Original HTLC order format
+        console.log("[API] Processing HTLC order format");
+        
+        // Validate required HTLCOrder fields
+        if (!htlcOrder.userAddress || !htlcOrder.srcChainId || !htlcOrder.srcToken ||
+            !htlcOrder.srcAmount || !htlcOrder.dstChainId || !htlcOrder.dstToken ||
+            !htlcOrder.secretHash || !htlcOrder.minAcceptablePrice || !htlcOrder.orderDuration ||
+            !htlcOrder.nonce || !htlcOrder.deadline) {
+          return res.status(400).json({ 
+            error: "Invalid htlcOrder: missing required fields" 
+          });
+        }
+        
+        // Create order with EIP-712 signature verification using the exact signed HTLCOrder
+        const order = await auctionService.createOrderFromHTLC(htlcOrder, signature, secret);
+        
+        res.json({
+          success: true,
+          orderId: order.orderId,
+          marketPrice: order.marketPrice,
+          expiresAt: order.expiresAt,
+          message: "EIP-712 signed order created and broadcasted to resolvers"
+        });
+        
+      } else {
         return res.status(400).json({ 
-          error: "Missing required fields: swapRequest, signature, or secret" 
+          error: "Missing required fields: either (htlcOrder, signature, secret) or sdkOrder" 
         });
       }
-      
-      // Validate required SwapRequest fields
-      if (!swapRequest.userAddress || !swapRequest.srcChainId || !swapRequest.srcToken ||
-          !swapRequest.srcAmount || !swapRequest.dstChainId || !swapRequest.dstToken ||
-          !swapRequest.secretHash || !swapRequest.minAcceptablePrice || !swapRequest.orderDuration) {
-        return res.status(400).json({ 
-          error: "Invalid swapRequest: missing required fields" 
-        });
-      }
-      
-      // Create order with EIP-712 signature verification
-      const order = await auctionService.createOrder(swapRequest, signature, secret);
-      
-      res.json({
-        success: true,
-        orderId: order.orderId,
-        marketPrice: order.marketPrice,
-        expiresAt: order.expiresAt,
-        message: "EIP-712 signed order created and broadcasted to resolvers"
-      });
       
     } catch (error: any) {
       console.error("[API] Error creating swap:", error);
@@ -72,6 +95,16 @@ export function createSwapRoutes(auctionService: AuctionService): Router {
       
     } catch (error: any) {
       console.error("[API] Error committing resolver:", error);
+      
+      // Handle race condition - order already committed
+      if (error.message.includes("already committed")) {
+        return res.status(409).json({ 
+          success: false,
+          error: "Order already taken by another resolver",
+          message: error.message 
+        });
+      }
+      
       res.status(500).json({ error: error.message });
     }
   });
@@ -154,7 +187,9 @@ export function createSwapRoutes(auctionService: AuctionService): Router {
       
       res.json({
         success: true,
-        message: "Settlement notification received"
+        message: "Funds verified and competition started. Check SecretsQueue for completion opportunity.",
+        competitionStarted: true,
+        hint: "All resolvers can now compete to complete the trade within 5 minutes"
       });
       
     } catch (error: any) {
@@ -267,13 +302,13 @@ export function createSwapRoutes(auctionService: AuctionService): Router {
   // Helper endpoint to get EIP-712 typed data for signing
   router.post("/get-typed-data", (req: Request, res: Response) => {
     try {
-      const { swapRequest }: { swapRequest: SwapRequest } = req.body;
+      const { swapRequest, nonce, deadline }: { swapRequest: SwapRequest; nonce?: string; deadline?: number } = req.body;
       
       if (!swapRequest) {
         return res.status(400).json({ error: "Missing swapRequest" });
       }
       
-      // Create HTLCOrder from SwapRequest
+      // Create HTLCOrder from SwapRequest with optional custom nonce and deadline
       const htlcOrder = EIP712Utils.createHTLCOrder(
         swapRequest.userAddress,
         swapRequest.srcChainId,
@@ -283,7 +318,9 @@ export function createSwapRoutes(auctionService: AuctionService): Router {
         swapRequest.dstToken,
         swapRequest.secretHash,
         swapRequest.minAcceptablePrice,
-        swapRequest.orderDuration
+        swapRequest.orderDuration,
+        nonce,
+        deadline
       );
       
       // Get verifying contract for the source chain
@@ -296,9 +333,10 @@ export function createSwapRoutes(auctionService: AuctionService): Router {
       const typedData = EIP712Utils.createTypedData(htlcOrder, domain);
       
       res.json({
+        htlcOrder,
         typedData,
         orderId: EIP712Utils.getOrderHash(htlcOrder, domain),
-        message: "Use this typed data with ethers.signTypedData or wallet's signTypedData method"
+        message: "Use this typed data and include the htlcOrder in your create-swap request"
       });
       
     } catch (error: any) {
