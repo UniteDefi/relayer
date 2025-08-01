@@ -41,12 +41,22 @@ export class DutchAuctionService {
       throw new Error("Auction duration must be positive");
     }
     
-    // In a Dutch auction for the user:
-    // - Start at worst price (minAcceptablePrice)
-    // - End at best price (marketPrice)
+    // In a Dutch auction for cross-chain swaps:
+    // - Start ABOVE market price (e.g., 102 DAI for 100 USDT) to incentivize resolvers
+    // - End at minimum acceptable price (e.g., 95 DAI for 100 USDT)
+    // This gives resolvers profit opportunity that decreases over time
+    
+    const marketPriceBig = BigInt(marketPrice);
+    const minPriceBig = BigInt(minAcceptablePrice);
+    
+    // Start at 2% above market price or 107% of min price, whichever is higher
+    const marketBasedStart = (marketPriceBig * BigInt(102)) / BigInt(100);
+    const minBasedStart = (minPriceBig * BigInt(107)) / BigInt(100);
+    const startPriceBig = marketBasedStart > minBasedStart ? marketBasedStart : minBasedStart;
+    
     return {
-      startPrice: minAcceptablePrice,
-      endPrice: marketPrice,
+      startPrice: startPriceBig.toString(),
+      endPrice: minAcceptablePrice,
       startTime: Date.now(),
       duration: duration
     };
@@ -54,7 +64,7 @@ export class DutchAuctionService {
   
   /**
    * Calculates the current price in a Dutch auction
-   * Price linearly improves from start (worst) to end (best) over duration
+   * Price linearly decreases from start (high) to end (min acceptable) over duration
    * @param params Dutch auction parameters
    * @param timestamp Current timestamp (defaults to now)
    */
