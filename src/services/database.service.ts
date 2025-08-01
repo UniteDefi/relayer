@@ -48,6 +48,17 @@ export class DatabaseService {
     await this.dynamodb.saveSecret(orderId, secretHash, secret);
   }
   
+  // SDK Order Data Management
+  async saveSDKOrderData(orderId: string, orderData: any, extension: string): Promise<void> {
+    // For now, we store this as part of the order data
+    // In a production system, this might be stored separately
+    const order = await this.getOrder(orderId);
+    if (order) {
+      order.sdkOrder = { orderData, extension, orderHash: orderId };
+      await this.saveOrder(order);
+    }
+  }
+  
   async getSecret(orderId: string): Promise<string | null> {
     return await this.dynamodb.getSecret(orderId);
   }
