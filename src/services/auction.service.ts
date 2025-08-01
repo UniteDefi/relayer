@@ -1,7 +1,7 @@
 import { ethers } from "ethers";
 import { OrderData, SwapRequest, ResolverCommitment, SettlementNotification, EscrowReadyNotification, HTLCOrder } from "../types";
 import { BlockchainService } from "./blockchain.service";
-import { SQSService } from "./sqs.service";
+import { SQSService, SQSSecretMessage } from "./sqs.service";
 import { DatabaseService } from "./database.service";
 import { DutchAuctionService, DutchAuctionParams } from "./dutch-auction.service";
 import { EIP712Utils } from "../utils/eip712.utils";
@@ -19,10 +19,17 @@ export class AuctionService {
     this.databaseService = databaseService;
     
     // Initialize mock market prices
+    // For token pairs, this represents how many dst tokens per src token (with 6 decimals)
+    // E.g., "1000000" means 1:1 ratio (1 USDT = 1 DAI)
     this.marketPrices.set("USDT-DAI", "1000000"); // 1:1 for stablecoins
     this.marketPrices.set("DAI-USDT", "1000000");
     this.marketPrices.set("USDC-DAI", "1000000");
     this.marketPrices.set("DAI-USDC", "1000000");
+    
+    // For cross-chain pairs, add the token addresses as keys
+    // These are mock token addresses from deployments
+    this.marketPrices.set("0x8465d8d2c0a3228ddbfa8b0c495cd14d2dbee8ac-0xcc14100211626d4d6fc8751fb62c16a7d5be502f", "1000000"); // ETH USDT to Base USDT
+    this.marketPrices.set("0xcc14100211626d4d6fc8751fb62c16a7d5be502f-0x8465d8d2c0a3228ddbfa8b0c495cd14d2dbee8ac", "1000000"); // Base USDT to ETH USDT
     
     // Start background task to check expired orders and rescue opportunities
     setInterval(() => this.checkExpiredOrders(), 10000); // Every 10 seconds
@@ -101,10 +108,12 @@ export class AuctionService {
     const marketPrice = this.marketPrices.get(pairKey) || swapRequest.minAcceptablePrice;
     
     // Calculate Dutch auction parameters using the pricing service
+    // Use shorter auction duration (60s) for faster testing, while keeping order duration at 300s
+    const auctionDurationSeconds = 60; // Fast auction for testing
     const auctionParams = DutchAuctionService.createAuctionParams(
       swapRequest.minAcceptablePrice,
       marketPrice,
-      swapRequest.orderDuration
+      auctionDurationSeconds
     );
     
     // Extract values for backward compatibility
@@ -137,6 +146,235 @@ export class AuctionService {
     
     return orderData;
   }
+
+  async createOrderFromHTLC(htlcOrder: HTLCOrder, signature: string, secret: string): Promise<OrderData> {
+    console.log(`[Order] Creating order from signed HTLCOrder`);
+    console.log(`[Order] HTLCOrder nonce: ${htlcOrder.nonce}, deadline: ${htlcOrder.deadline}`);
+    
+    // Verify EIP-712 signature using the exact signed HTLCOrder
+    const verifyingContract = config.chains[htlcOrder.srcChainId]?.escrowFactory || ethers.ZeroAddress;
+    const isValidSignature = EIP712Utils.verifySignature(
+      htlcOrder,
+      signature,
+      htlcOrder.userAddress,
+      htlcOrder.srcChainId,
+      verifyingContract
+    );
+    
+    if (!isValidSignature) {
+      throw new Error("Invalid EIP-712 signature");
+    }
+    
+    // Generate order ID from EIP-712 hash using the exact signed order
+    const domain = EIP712Utils.getDomain(htlcOrder.srcChainId, verifyingContract);
+    const orderId = EIP712Utils.getOrderHash(htlcOrder, domain);
+    
+    console.log(`[Order] Verified EIP-712 signature for order ${orderId}`);
+    
+    // Verify secret hash matches
+    const secretBytes32 = ethers.encodeBytes32String(secret);
+    const computedHash = ethers.keccak256(secretBytes32);
+    
+    if (computedHash !== htlcOrder.secretHash) {
+      console.error(`[Order] Secret hash mismatch! Expected: ${htlcOrder.secretHash}, Got: ${computedHash}`);
+      throw new Error("Secret hash mismatch");
+    }
+    
+    // Store secret securely in database
+    await this.databaseService.saveSecret(orderId, htlcOrder.secretHash, secret);
+    
+    // Step 1 Verification: Check user has approved UniteEscrowFactory
+    const escrowFactory = config.chains[htlcOrder.srcChainId]?.escrowFactory;
+    if (!escrowFactory) {
+      throw new Error(`No escrow factory configured for chain ${htlcOrder.srcChainId}`);
+    }
+    
+    const approvedAmount = await this.blockchainService.checkAllowance(
+      htlcOrder.srcChainId,
+      htlcOrder.srcToken,
+      htlcOrder.userAddress,
+      escrowFactory
+    );
+    
+    if (BigInt(approvedAmount) < BigInt(htlcOrder.srcAmount)) {
+      throw new Error("Insufficient allowance. User must approve UniteEscrowFactory first (Step 1).");
+    }
+    
+    console.log(`[Order] User has approved ${approvedAmount} tokens to UniteEscrowFactory`);
+    
+    // Get current market price
+    const pairKey = `${htlcOrder.srcToken}-${htlcOrder.dstToken}`;
+    const marketPrice = this.marketPrices.get(pairKey) || htlcOrder.minAcceptablePrice;
+    
+    // Calculate Dutch auction parameters using the pricing service
+    // Use shorter auction duration (60s) for faster testing, while keeping order duration at 300s
+    const auctionDurationSeconds = 60; // Fast auction for testing
+    const auctionParams = DutchAuctionService.createAuctionParams(
+      htlcOrder.minAcceptablePrice,
+      marketPrice,
+      auctionDurationSeconds
+    );
+    
+    // Extract values for backward compatibility
+    const auctionStartPrice = auctionParams.startPrice;
+    const auctionEndPrice = auctionParams.endPrice;
+    const auctionDuration = auctionParams.duration;
+    
+    // Convert HTLCOrder to SwapRequest for backward compatibility with existing code
+    const swapRequest: SwapRequest = {
+      userAddress: htlcOrder.userAddress,
+      signature: signature,
+      srcChainId: htlcOrder.srcChainId,
+      srcToken: htlcOrder.srcToken,
+      srcAmount: htlcOrder.srcAmount,
+      dstChainId: htlcOrder.dstChainId,
+      dstToken: htlcOrder.dstToken,
+      secretHash: htlcOrder.secretHash,
+      minAcceptablePrice: htlcOrder.minAcceptablePrice,
+      orderDuration: htlcOrder.orderDuration
+    };
+    
+    // Create order data
+    const orderData: OrderData = {
+      orderId,
+      swapRequest,
+      marketPrice,
+      status: "active",
+      createdAt: Date.now(),
+      expiresAt: Date.now() + (htlcOrder.orderDuration * 1000),
+      auctionStartPrice,
+      auctionEndPrice,
+      auctionDuration
+    };
+    
+    console.log(`[Order] Created order ${orderId} from signed HTLC`);
+    console.log(`[Order] Market price: ${marketPrice}`);
+    console.log(`[Order] Signature: ${signature.substring(0, 10)}...`);
+    
+    // Store order in database
+    await this.databaseService.saveOrder(orderData);
+    
+    // Step 3: Broadcast to resolvers with secret hash only (not the secret)
+    await this.broadcastOrderToResolvers(orderData);
+    
+    return orderData;
+  }
+  
+  async createOrderFromSDK(
+    orderData: any,
+    orderHash: string,
+    extension: string,
+    signature: string,
+    secret: string,
+    htlcOrder: HTLCOrder
+  ): Promise<OrderData> {
+    console.log(`[Order] Creating order from SDK format`);
+    console.log(`[Order] Order hash: ${orderHash}`);
+    console.log(`[Order] Extension length: ${extension.length}`);
+    
+    // Verify the signature against the SDK order
+    const recoveredAddress = ethers.recoverAddress(orderHash, signature);
+    
+    if (recoveredAddress.toLowerCase() !== htlcOrder.userAddress.toLowerCase()) {
+      console.error(`[Order] Signature verification failed. Expected: ${htlcOrder.userAddress}, Got: ${recoveredAddress}`);
+      throw new Error("Invalid SDK order signature");
+    }
+    
+    console.log(`[Order] Verified SDK order signature from ${recoveredAddress}`);
+    
+    // Use the provided order hash as the order ID
+    const orderId = orderHash;
+    
+    // Verify secret hash matches
+    const secretBytes32 = ethers.encodeBytes32String(secret);
+    const computedHash = ethers.keccak256(secretBytes32);
+    
+    if (computedHash !== htlcOrder.secretHash) {
+      console.error(`[Order] Secret hash mismatch! Expected: ${htlcOrder.secretHash}, Got: ${computedHash}`);
+      throw new Error("Secret hash mismatch");
+    }
+    
+    // Store secret securely in database
+    await this.databaseService.saveSecret(orderId, htlcOrder.secretHash, secret);
+    
+    // Step 1 Verification: Check user has approved UniteEscrowFactory
+    const escrowFactory = config.chains[htlcOrder.srcChainId]?.escrowFactory;
+    if (!escrowFactory) {
+      throw new Error(`No escrow factory configured for chain ${htlcOrder.srcChainId}`);
+    }
+    
+    const approvedAmount = await this.blockchainService.checkAllowance(
+      htlcOrder.srcChainId,
+      htlcOrder.srcToken,
+      htlcOrder.userAddress,
+      escrowFactory
+    );
+    
+    if (BigInt(approvedAmount) < BigInt(htlcOrder.srcAmount)) {
+      throw new Error("Insufficient allowance. User must approve UniteEscrowFactory first (Step 1).");
+    }
+    
+    console.log(`[Order] User has approved ${approvedAmount} tokens to UniteEscrowFactory`);
+    
+    // Get current market price
+    const pairKey = `${htlcOrder.srcToken}-${htlcOrder.dstToken}`;
+    const marketPrice = this.marketPrices.get(pairKey) || htlcOrder.minAcceptablePrice;
+    
+    // Calculate Dutch auction parameters
+    const auctionDurationSeconds = 60; // Fast auction for testing
+    const auctionParams = DutchAuctionService.createAuctionParams(
+      htlcOrder.minAcceptablePrice,
+      marketPrice,
+      auctionDurationSeconds
+    );
+    
+    // Convert HTLCOrder to SwapRequest for backward compatibility
+    const swapRequest: SwapRequest = {
+      userAddress: htlcOrder.userAddress,
+      signature: signature,
+      srcChainId: htlcOrder.srcChainId,
+      srcToken: htlcOrder.srcToken,
+      srcAmount: htlcOrder.srcAmount,
+      dstChainId: htlcOrder.dstChainId,
+      dstToken: htlcOrder.dstToken,
+      secretHash: htlcOrder.secretHash,
+      minAcceptablePrice: htlcOrder.minAcceptablePrice,
+      orderDuration: htlcOrder.orderDuration
+    };
+    
+    // Create order data with SDK-specific fields
+    const orderDataObject: OrderData = {
+      orderId,
+      swapRequest,
+      marketPrice,
+      status: "active",
+      createdAt: Date.now(),
+      expiresAt: Date.now() + (htlcOrder.orderDuration * 1000),
+      auctionStartPrice: auctionParams.startPrice,
+      auctionEndPrice: auctionParams.endPrice,
+      auctionDuration: auctionParams.duration,
+      // Store SDK-specific data
+      sdkOrder: {
+        orderData,
+        extension,
+        orderHash
+      }
+    };
+    
+    console.log(`[Order] Created SDK order ${orderId}`);
+    console.log(`[Order] Market price: ${marketPrice}`);
+    
+    // Store order in database
+    await this.databaseService.saveOrder(orderDataObject);
+    
+    // Store SDK order data for resolvers
+    await this.databaseService.saveSDKOrderData(orderId, orderData, extension);
+    
+    // Broadcast to resolvers
+    await this.broadcastOrderToResolvers(orderDataObject);
+    
+    return orderDataObject;
+  }
   
   private async broadcastOrderToResolvers(order: OrderData) {
     console.log(`[Order] Broadcasting order ${order.orderId} to resolvers`);
@@ -153,14 +391,56 @@ export class AuctionService {
       expiresAt: order.expiresAt
     });
     
+    // Convert prices from internal format (with 6 decimals) to human-readable format
+    // E.g., "1016500" -> "1.0165" (using ethers formatUnits)
+    const startPriceFormatted = ethers.formatUnits(order.auctionStartPrice, 6);
+    const endPriceFormatted = ethers.formatUnits(order.auctionEndPrice, 6);
+    
+    console.log(`[Order] Auction prices - Start: ${startPriceFormatted}, End: ${endPriceFormatted}`);
+    
+    // For now, hardcode common token decimals
+    // TODO: Fetch these dynamically from blockchain
+    const getTokenDecimals = (address: string, chainId: number): number => {
+      // MockERC20 (USDT) has 6 decimals
+      const usdtAddresses = [
+        '0x8465d8d2c0a3228ddbfa8b0c495cd14d2dbee8ac', // ETH Sepolia
+        '0xcc14100211626d4d6fc8751fb62c16a7d5be502f', // Base Sepolia
+        '0x15203c110ea8f48ac4216af44c6690a378993540', // Arbitrum Sepolia
+        '0x1efa70cebaee4a28e3338ed7d316a28ce6e1d4f9', // Monad Testnet
+      ];
+      
+      // MockERC20_2 (DAI) has 18 decimals
+      const daiAddresses = [
+        '0x0da822fd04de975b2918ed62b11e9b85460b92ca', // ETH Sepolia
+        '0x4888dc936f9b9e398fd3b63ab2a6906f5caec795', // Base Sepolia
+        '0xa0db2578292a24714c8c905556ebbebb962152c5', // Arbitrum Sepolia
+        '0x9fdb806b9a7fa4bf00483af2898ae16ef01f5960', // Monad Testnet
+      ];
+      
+      if (usdtAddresses.includes(address.toLowerCase())) {
+        return 6;
+      }
+      if (daiAddresses.includes(address.toLowerCase())) {
+        return 18;
+      }
+      
+      // Default to 18 for unknown tokens
+      return 18;
+    };
+    
+    const srcDecimals = getTokenDecimals(order.swapRequest.srcToken, order.swapRequest.srcChainId);
+    const dstDecimals = getTokenDecimals(order.swapRequest.dstToken, order.swapRequest.dstChainId);
+    
     // Broadcast order to SQS for resolvers to consume
     try {
       await this.sqsService.broadcastOrder(
         order.orderId,
         order,
-        order.auctionStartPrice,
-        order.auctionEndPrice,
-        order.auctionDuration
+        startPriceFormatted,
+        endPriceFormatted,
+        order.auctionDuration,
+        srcDecimals,
+        dstDecimals
       );
       console.log(`[Order] Successfully broadcasted order ${order.orderId} to SQS`);
     } catch (error) {
@@ -293,7 +573,7 @@ export class AuctionService {
       order.swapRequest.userAddress,
       order.swapRequest.srcToken,
       order.swapRequest.srcAmount,
-      order.srcEscrowAddress
+      orderId
     );
     
     order.status = "settling";
@@ -326,17 +606,25 @@ export class AuctionService {
       throw new Error("Unauthorized resolver");
     }
     
-    // Verify resolver deposited correct amount
-    const verified = await this.blockchainService.verifyResolverDeposit(
+    console.log(`[Order] Step 8: Verifying both escrows are funded for order ${notification.orderId}`);
+    
+    // NEW: Verify both source and destination escrows have the correct funds
+    const fundVerification = await this.blockchainService.verifyBothEscrowsFunded(
+      order.swapRequest.srcChainId,
       order.swapRequest.dstChainId,
-      notification.dstTxHash,
+      order.srcEscrowAddress!,
       order.dstEscrowAddress!,
+      order.swapRequest.srcToken,
+      order.swapRequest.dstToken,
+      order.swapRequest.srcAmount,
       notification.dstTokenAmount
     );
     
-    if (!verified) {
-      throw new Error("Invalid resolver deposit");
+    if (!fundVerification.srcFunded || !fundVerification.dstFunded) {
+      throw new Error(`Fund verification failed - src: ${fundVerification.srcFunded}, dst: ${fundVerification.dstFunded}`);
     }
+    
+    console.log(`[Order] ✅ Both escrows verified with correct funds`);
     
     // Store destination transaction
     if (!order.settlementTx) {
@@ -349,8 +637,59 @@ export class AuctionService {
     
     console.log(`[Order] Resolver notified settlement for order ${notification.orderId}`);
     
-    // Start settlement finalization process
-    this.finalizeSettlement(notification.orderId);
+    // NEW: Instead of immediate finalization, publish to competitive SecretsQueue
+    await this.publishSecretForCompetition(notification.orderId);
+  }
+
+  private async publishSecretForCompetition(orderId: string): Promise<void> {
+    const order = await this.databaseService.getOrder(orderId);
+    if (!order) {
+      throw new Error("Order not found");
+    }
+
+    // Get the secret from database
+    const secret = await this.databaseService.getSecret(orderId);
+    if (!secret) {
+      throw new Error("Secret not found");
+    }
+
+    // Wait additional delay for safety (like before)
+    console.log(`[Order] Waiting ${config.order.secretRevealDelay}s before starting competition`);
+    await new Promise(resolve => setTimeout(resolve, config.order.secretRevealDelay * 1000));
+
+    // Set competition deadline (5 minutes from now)
+    const competitionDeadline = Date.now() + (5 * 60 * 1000); // 5 minutes
+
+    // Create secret message for competitive resolution
+    const secretMessage = {
+      orderId: order.orderId,
+      secret: secret,
+      resolverAddress: order.resolver!,
+      srcEscrowAddress: order.srcEscrowAddress!,
+      dstEscrowAddress: order.dstEscrowAddress!,
+      srcChainId: order.swapRequest.srcChainId,
+      dstChainId: order.swapRequest.dstChainId,
+      srcAmount: order.swapRequest.srcAmount,
+      dstAmount: order.settlementTx?.dstTokenAmount || order.swapRequest.srcAmount, // fallback to srcAmount
+      timestamp: Date.now(),
+      competitionDeadline: competitionDeadline
+    };
+
+    // Update order status to indicate competition has started
+    order.status = "competing";
+    order.competitionStarted = Date.now();
+    order.competitionDeadline = competitionDeadline;
+    
+    // Save to database
+    await this.databaseService.saveOrder(order);
+
+    // Publish to SecretsQueue for all resolvers to compete
+    await this.sqsService.broadcastSecret(secretMessage);
+
+    console.log(`[Order] 🏁 Competition started for order ${orderId}`);
+    console.log(`[Order] Competition deadline: ${new Date(competitionDeadline).toISOString()}`);
+    console.log(`[Order] Original resolver ${order.resolver} has 5 minutes to complete`);
+    console.log(`[Order] Other resolvers can rescue after deadline for safety deposit rewards`);
   }
   
   private async finalizeSettlement(orderId: string): Promise<void> {
