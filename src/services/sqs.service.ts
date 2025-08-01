@@ -17,12 +17,30 @@ export interface SQSOrderMessage {
   auctionStartPrice: string;
   auctionEndPrice: string;
   auctionDuration: number;
+  srcTokenDecimals?: number;
+  dstTokenDecimals?: number;
+}
+
+export interface SQSSecretMessage {
+  orderId: string;
+  secret: string;
+  resolverAddress: string;
+  srcEscrowAddress: string;
+  dstEscrowAddress: string;
+  srcChainId: number;
+  dstChainId: number;
+  srcAmount: string;
+  dstAmount: string;
+  timestamp: number;
+  competitionDeadline: number; // 5 minutes from now
 }
 
 export class SQSService {
   private sqsClient: SQSClient;
-  private queueUrl: string = "https://sqs.us-east-1.amazonaws.com/112639119226/BridgeIntentQueue";
-  private readonly queueName: string = "BridgeIntentQueue";
+  private queueUrl: string = "";
+  private secretsQueueUrl: string = "";
+  private readonly queueName: string = "UniteDefiIntentQueue";
+  private readonly secretsQueueName: string = "SecretsQueue";
 
   constructor() {
     const sqsConfig: SQSClientConfig = {
@@ -41,37 +59,47 @@ export class SQSService {
 
   async initialize(): Promise<void> {
     try {
-      // Try to get existing queue URL
-      const getQueueUrlCommand = new GetQueueUrlCommand({
-        QueueName: this.queueName
-      });
-
-      try {
-        const response = await this.sqsClient.send(getQueueUrlCommand);
-        this.queueUrl = response.QueueUrl!;
-        console.log("[SQS] Using existing queue:", this.queueUrl);
-      } catch (error: any) {
-        if (error.name === "QueueDoesNotExist") {
-          // Create new FIFO queue
-          console.log("[SQS] Queue does not exist, creating new FIFO queue...");
-          await this.createQueue();
-        } else {
-          throw error;
-        }
-      }
+      // Initialize both queues
+      await Promise.all([
+        this.initializeQueue(this.queueName, "queueUrl"),
+        this.initializeQueue(this.secretsQueueName, "secretsQueueUrl")
+      ]);
     } catch (error) {
       console.error("[SQS] Failed to initialize SQS service:", error);
       throw error;
     }
   }
 
-  private async createQueue(): Promise<void> {
+  private async initializeQueue(queueName: string, urlProperty: "queueUrl" | "secretsQueueUrl"): Promise<void> {
+    try {
+      // Try to get existing queue URL
+      const getQueueUrlCommand = new GetQueueUrlCommand({
+        QueueName: queueName
+      });
+
+      try {
+        const response = await this.sqsClient.send(getQueueUrlCommand);
+        this[urlProperty] = response.QueueUrl!;
+        console.log(`[SQS] Using existing queue ${queueName}:`, this[urlProperty]);
+      } catch (error: any) {
+        if (error.name === "QueueDoesNotExist") {
+          // Create new queue
+          console.log(`[SQS] Queue ${queueName} does not exist, creating new queue...`);
+          await this.createQueue(queueName, urlProperty);
+        } else {
+          throw error;
+        }
+      }
+    } catch (error) {
+      console.error(`[SQS] Failed to initialize queue ${queueName}:`, error);
+      throw error;
+    }
+  }
+
+  private async createQueue(queueName: string, urlProperty: "queueUrl" | "secretsQueueUrl"): Promise<void> {
     const createQueueCommand = new CreateQueueCommand({
-      QueueName: this.queueName,
+      QueueName: queueName,
       Attributes: {
-        // FIFO queue attributes
-        FifoQueue: "true",
-        ContentBasedDeduplication: "true",
         // Message retention period (7 days)
         MessageRetentionPeriod: "604800",
         // Visibility timeout (5 minutes to match order timeout)
@@ -82,8 +110,8 @@ export class SQSService {
     });
 
     const response = await this.sqsClient.send(createQueueCommand);
-    this.queueUrl = response.QueueUrl!;
-    console.log("[SQS] Created new FIFO queue:", this.queueUrl);
+    this[urlProperty] = response.QueueUrl!;
+    console.log(`[SQS] Created new queue ${queueName}:`, this[urlProperty]);
   }
 
   async broadcastOrder(
@@ -91,7 +119,9 @@ export class SQSService {
     orderData: OrderData,
     auctionStartPrice: string,
     auctionEndPrice: string,
-    auctionDuration: number
+    auctionDuration: number,
+    srcTokenDecimals?: number,
+    dstTokenDecimals?: number
   ): Promise<void> {
     if (!this.queueUrl) {
       throw new Error("SQS queue not initialized");
@@ -103,15 +133,14 @@ export class SQSService {
       timestamp: Date.now(),
       auctionStartPrice,
       auctionEndPrice,
-      auctionDuration
+      auctionDuration,
+      srcTokenDecimals,
+      dstTokenDecimals
     };
 
     const params: SendMessageCommandInput = {
       QueueUrl: this.queueUrl,
-      MessageBody: JSON.stringify(message),
-      // FIFO specific attributes
-      MessageGroupId: "orders", // All orders in same group for ordering
-      MessageDeduplicationId: orderId // Use order ID for deduplication
+      MessageBody: JSON.stringify(message)
     };
 
     try {
@@ -124,10 +153,38 @@ export class SQSService {
     }
   }
 
+  async broadcastSecret(secretMessage: SQSSecretMessage): Promise<void> {
+    if (!this.secretsQueueUrl) {
+      throw new Error("Secrets queue not initialized");
+    }
+
+    const params: SendMessageCommandInput = {
+      QueueUrl: this.secretsQueueUrl,
+      MessageBody: JSON.stringify(secretMessage)
+    };
+
+    try {
+      const command = new SendMessageCommand(params);
+      const response = await this.sqsClient.send(command);
+      console.log(`[SQS] Broadcasted secret for order ${secretMessage.orderId} to SecretsQueue. MessageId: ${response.MessageId}`);
+      console.log(`[SQS] Competition deadline: ${new Date(secretMessage.competitionDeadline).toISOString()}`);
+    } catch (error) {
+      console.error(`[SQS] Failed to broadcast secret for order ${secretMessage.orderId}:`, error);
+      throw error;
+    }
+  }
+
   async getQueueUrl(): Promise<string> {
     if (!this.queueUrl) {
       await this.initialize();
     }
     return this.queueUrl!;
+  }
+
+  async getSecretsQueueUrl(): Promise<string> {
+    if (!this.secretsQueueUrl) {
+      await this.initialize();
+    }
+    return this.secretsQueueUrl!;
   }
 }
