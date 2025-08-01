@@ -21,7 +21,8 @@ export class BlockchainService {
     "function createDstEscrow(tuple(bytes32 orderHash, bytes32 hashlock, address maker, address taker, address token, uint256 amount, uint256 safetyDeposit, tuple(uint32 srcWithdrawal, uint32 srcCancellation, uint32 srcPublicWithdrawal, uint32 srcPublicCancellation, uint32 dstWithdrawal, uint32 dstCancellation, uint32 dstPublicWithdrawal, uint32 deployedAt) timelocks) dstImmutables, uint256 srcCancellationTimestamp) payable",
     "function addressOfEscrowSrc(tuple(bytes32 orderHash, bytes32 hashlock, address maker, address taker, address token, uint256 amount, uint256 safetyDeposit, tuple(uint32 srcWithdrawal, uint32 srcCancellation, uint32 srcPublicWithdrawal, uint32 srcPublicCancellation, uint32 dstWithdrawal, uint32 dstCancellation, uint32 dstPublicWithdrawal, uint32 deployedAt) timelocks) immutables) view returns (address)",
     "function addressOfEscrowDst(tuple(bytes32 orderHash, bytes32 hashlock, address maker, address taker, address token, uint256 amount, uint256 safetyDeposit, tuple(uint32 srcWithdrawal, uint32 srcCancellation, uint32 srcPublicWithdrawal, uint32 srcPublicCancellation, uint32 dstWithdrawal, uint32 dstCancellation, uint32 dstPublicWithdrawal, uint32 deployedAt) timelocks) immutables) view returns (address)",
-    "function transferUserFundsToEscrow(address user, address token, uint256 amount, address escrow) external",
+    "function getTotalFilledAmount(bytes32 orderHash) external view returns (uint256)",
+    "function transferUserFunds(bytes32 orderHash, address from, address token, uint256 amount) external",
     "function authorizeRelayer(address relayer) external",
     "function revokeRelayer(address relayer) external",
     "function authorizedRelayers(address) view returns (bool)",
@@ -101,12 +102,36 @@ export class BlockchainService {
     return true;
   }
   
+  async getTotalFilledAmount(
+    chainId: number,
+    orderHash: string
+  ): Promise<string> {
+    const provider = this.providers.get(chainId);
+    if (!provider) {
+      throw new Error(`Chain ${chainId} not configured`);
+    }
+    
+    const escrowFactory = this.escrowFactories.get(chainId);
+    if (!escrowFactory) {
+      throw new Error(`No escrow factory for chain ${chainId}`);
+    }
+    
+    try {
+      const contract = new ethers.Contract(escrowFactory, this.UNITE_ESCROW_FACTORY_ABI, provider);
+      const totalFilled = await contract.getTotalFilledAmount(orderHash);
+      return totalFilled.toString();
+    } catch (error) {
+      console.error("[Blockchain] Error getting total filled amount:", error);
+      throw new Error(`Failed to get total filled amount: ${error.message}`);
+    }
+  }
+
   async transferUserFundsToEscrow(
     chainId: number,
     userAddress: string,
     tokenAddress: string,
     amount: string,
-    escrowAddress: string
+    orderHash: string
   ): Promise<string> {
     const provider = this.providers.get(chainId);
     const wallet = this.wallets.get(chainId);
@@ -119,7 +144,7 @@ export class BlockchainService {
       user: userAddress,
       token: tokenAddress,
       amount,
-      escrow: escrowAddress
+      orderHash
     });
     
     // Get UniteEscrowFactory address
@@ -137,12 +162,16 @@ export class BlockchainService {
         throw new Error(`Relayer ${wallet.address} is not authorized in UniteEscrowFactory`);
       }
       
-      // Call the UniteEscrowFactory to transfer user's pre-approved funds to escrow
-      const tx = await contract.transferUserFundsToEscrow(
+      // Check total filled amount before transferring
+      const totalFilled = await contract.getTotalFilledAmount(orderHash);
+      console.log(`[Blockchain] Current total filled amount: ${totalFilled.toString()}`);
+      
+      // Call the new UniteEscrowFactory method to transfer user's pre-approved funds
+      const tx = await contract.transferUserFunds(
+        orderHash,
         userAddress,
         tokenAddress,
-        amount,
-        escrowAddress
+        amount
       );
       console.log(`[Blockchain] Step 7 Transfer TX: ${tx.hash}`);
       
@@ -639,7 +668,7 @@ export class BlockchainService {
   async transferUserFunds(
     chainId: number,
     userAddress: string,
-    escrowAddress: string,
+    orderHash: string,
     tokenAddress: string,
     amount: string
   ): Promise<string> {
@@ -653,9 +682,9 @@ export class BlockchainService {
       throw new Error(`No escrow factory for chain ${chainId}`);
     }
     
-    console.log("[Blockchain] Transferring user funds to escrow via UniteEscrowFactory:", {
+    console.log("[Blockchain] Transferring user funds via UniteEscrowFactory:", {
       userAddress,
-      escrowAddress,
+      orderHash,
       tokenAddress,
       amount
     });
@@ -663,12 +692,16 @@ export class BlockchainService {
     try {
       const factory = new ethers.Contract(escrowFactory, this.UNITE_ESCROW_FACTORY_ABI, wallet);
       
-      // Use UniteEscrowFactory to transfer user's pre-approved funds to escrow
-      const tx = await factory.transferUserFundsToEscrow(
+      // Check total filled amount before transferring
+      const totalFilled = await factory.getTotalFilledAmount(orderHash);
+      console.log(`[Blockchain] Current total filled amount: ${totalFilled.toString()}`);
+      
+      // Use new UniteEscrowFactory method to transfer user's pre-approved funds
+      const tx = await factory.transferUserFunds(
+        orderHash,
         userAddress,
         tokenAddress,
-        amount,
-        escrowAddress
+        amount
       );
       console.log("[Blockchain] User funds transfer TX:", tx.hash);
       
@@ -800,6 +833,64 @@ export class BlockchainService {
     } catch (error) {
       console.error("[Blockchain] Failed to get gas price:", error);
       throw new Error(`Failed to get gas price: ${error.message}`);
+    }
+  }
+
+  async verifyBothEscrowsFunded(
+    srcChainId: number,
+    dstChainId: number,
+    srcEscrowAddress: string,
+    dstEscrowAddress: string,
+    srcTokenAddress: string,
+    dstTokenAddress: string,
+    expectedSrcAmount: string,
+    expectedDstAmount: string
+  ): Promise<{ srcFunded: boolean; dstFunded: boolean }> {
+    console.log(`[Blockchain] Verifying funds in both escrows:`);
+    console.log(`[Blockchain] - Source: ${srcEscrowAddress} on chain ${srcChainId} (${expectedSrcAmount})`);
+    console.log(`[Blockchain] - Destination: ${dstEscrowAddress} on chain ${dstChainId} (${expectedDstAmount})`);
+
+    try {
+      // Check both escrows in parallel
+      const [srcFunded, dstFunded] = await Promise.all([
+        this.verifyEscrowBalance(srcChainId, srcEscrowAddress, srcTokenAddress, expectedSrcAmount),
+        this.verifyEscrowBalance(dstChainId, dstEscrowAddress, dstTokenAddress, expectedDstAmount)
+      ]);
+
+      console.log(`[Blockchain] Fund verification results: src=${srcFunded}, dst=${dstFunded}`);
+      
+      return { srcFunded, dstFunded };
+    } catch (error) {
+      console.error("[Blockchain] Error verifying escrow funds:", error);
+      return { srcFunded: false, dstFunded: false };
+    }
+  }
+
+  private async verifyEscrowBalance(
+    chainId: number,
+    escrowAddress: string,
+    tokenAddress: string,
+    expectedAmount: string
+  ): Promise<boolean> {
+    const provider = this.providers.get(chainId);
+    if (!provider) {
+      throw new Error(`Chain ${chainId} not configured`);
+    }
+
+    try {
+      const tokenContract = new ethers.Contract(tokenAddress, this.ERC20_ABI, provider);
+      const balance = await tokenContract.balanceOf(escrowAddress);
+      
+      const balanceStr = balance.toString();
+      const expectedAmountBN = ethers.getBigInt(expectedAmount);
+      
+      console.log(`[Blockchain] Escrow ${escrowAddress} balance: ${balanceStr}, expected: ${expectedAmount}`);
+      
+      // Balance should be >= expected amount (in case of precision differences)
+      return balance >= expectedAmountBN;
+    } catch (error) {
+      console.error(`[Blockchain] Error checking escrow balance on chain ${chainId}:`, error);
+      return false;
     }
   }
 }
