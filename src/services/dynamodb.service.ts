@@ -41,7 +41,6 @@ interface TradeItem {
   secret?: string;
   secretHash?: string;
   secretCreatedAt?: number;
-  secretRevealedAt?: number;
 }
 
 interface ResolverCommitmentItem {
