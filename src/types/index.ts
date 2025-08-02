@@ -20,6 +20,13 @@ export interface SwapRequest {
   orderDuration: number; // Order duration in seconds
 }
 
+// New request type that includes the complete signed HTLCOrder
+export interface CreateSwapRequest {
+  htlcOrder: HTLCOrder;
+  signature: string;
+  secret: string;
+}
+
 export interface OrderData {
   orderId: string;
   swapRequest: SwapRequest;
@@ -54,6 +61,13 @@ export interface OrderData {
   // Secret management
   secretRevealedAt?: number;
   secretRevealTxHash?: string;
+  
+  // SDK order data (for 1inch cross-chain SDK orders)
+  sdkOrder?: {
+    orderData: any;
+    extension: string;
+    orderHash: string;
+  };
 }
 
 export interface ResolverCommitment {
