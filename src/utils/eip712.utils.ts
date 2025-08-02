@@ -43,6 +43,12 @@ export class EIP712Utils {
       const domain = this.getDomain(chainId, verifyingContract);
       const typedData = this.createTypedData(order, domain);
       
+      console.log("[EIP712] Verifying signature:");
+      console.log("  Expected signer:", expectedSigner);
+      console.log("  Domain:", JSON.stringify(domain));
+      console.log("  Order:", JSON.stringify(order));
+      console.log("  Signature:", signature);
+      
       // Recover the signer
       const recoveredAddress = ethers.verifyTypedData(
         typedData.domain,
@@ -51,7 +57,11 @@ export class EIP712Utils {
         signature
       );
       
-      return recoveredAddress.toLowerCase() === expectedSigner.toLowerCase();
+      console.log("  Recovered address:", recoveredAddress);
+      const isValid = recoveredAddress.toLowerCase() === expectedSigner.toLowerCase();
+      console.log("  Signature valid:", isValid);
+      
+      return isValid;
     } catch (error) {
       console.error("[EIP712] Signature verification failed:", error);
       return false;
